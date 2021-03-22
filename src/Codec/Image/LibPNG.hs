@@ -1,5 +1,6 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 
+{-# OPTIONS_GHC -Wno-name-shadowing #-}
 module Codec.Image.LibPNG where
 
 import Foreign
@@ -13,6 +14,8 @@ newtype PNG = PNG (Ptr ())
 data PNGImage = PNGImage
     { widthImage :: Word
     , heightImage :: Word
+    , depthImage :: Word
+    , alphaPosImage :: Word
     , rowsImage :: [PNGRow] }
 
 newtype PNGRow = PNGRow
@@ -20,6 +23,9 @@ newtype PNGRow = PNGRow
 
 newtype Pixel = Pixel ( Word8, Word8, Word8, Word8 )
     deriving ( Eq, Ord, Show )
+
+rgbaDepth :: Word
+rgbaDepth = 4
 
 blackPixel :: Pixel
 blackPixel = Pixel ( 0, 0, 0, 255 )
@@ -57,24 +63,27 @@ rowFromPixels :: [Pixel] -> IO PNGRow
 rowFromPixels pixels = rowPtrFromPixels pixels >>= wrapRowPtr
 
 -- new uninitialized binary row
-rowEmpty :: Word -> IO PNGRow
-rowEmpty width = mallocArray (fromIntegral $ 4*width) >>= wrapRowPtr
+rowEmpty :: Word -> Word -> IO PNGRow
+rowEmpty depth width = mallocArray (fromIntegral $ depth*width) >>= wrapRowPtr
 
-pixelFromList :: [Word8] -> Maybe ( Pixel, [Word8] )
-pixelFromList ( r : g : b : a : ws ) = Just ( Pixel ( r, g, b, a ), ws )
-pixelFromList _ = Nothing
+pixelFromList :: Word -> [Word8] -> Maybe ( Pixel, [Word8] )
+pixelFromList 4 ( r : g : b : a : ws ) = Just ( Pixel ( r, g, b, a ), ws )
+pixelFromList 3 ( r : g : b : ws ) = Just ( Pixel ( r, g, b, 255 ), ws )
+pixelFromList 2 ( w : a : ws ) = Just ( Pixel ( w, w, w, a ), ws )
+pixelFromList 1 ( w : ws ) = Just ( Pixel ( w, w, w, 255 ), ws )
+pixelFromList _ _ = Nothing
 
-pixelsFromList :: [Word8] -> [Pixel]
-pixelsFromList = unfoldr pixelFromList
+pixelsFromList :: Word -> [Word8] -> [Pixel]
+pixelsFromList depth = unfoldr$ pixelFromList depth
 
-pixelsFromRowPtr :: Word -> Ptr Word8 -> IO [Pixel]
-pixelsFromRowPtr width rowp = do
-    ws <- peekArray (fromIntegral $ 4*width) rowp
-    return $ pixelsFromList ws
+pixelsFromRowPtr :: Word -> Word -> Ptr Word8 -> IO [Pixel]
+pixelsFromRowPtr depth width rowp = do
+    ws <- peekArray (fromIntegral $ depth*width) rowp
+    return $ pixelsFromList depth ws
 
 -- extract a list of pixels from a binary row
-pixelsFromRow :: Word -> PNGRow -> IO [Pixel]
-pixelsFromRow width (PNGRow rowfp) = withForeignPtr rowfp (pixelsFromRowPtr width)
+pixelsFromRow :: Word -> Word -> PNGRow -> IO [Pixel]
+pixelsFromRow depth width (PNGRow rowfp) = withForeignPtr rowfp$ pixelsFromRowPtr depth width
 
 -- construct a image struct from a list of list of pixels
 imageFromPixelss :: [[Pixel]] -> IO PNGImage
@@ -83,6 +92,8 @@ imageFromPixelss pixelss = do
     return $ PNGImage
         { widthImage = fromIntegral len
         , heightImage = fromIntegral $ length pixelss
+        , depthImage = rgbaDepth
+        , alphaPosImage = rgbaDepth - 1
         , rowsImage = rows }
   where
     len = length . head $ pixelss
@@ -90,9 +101,10 @@ imageFromPixelss pixelss = do
 
 -- extract a list of list of pixels from a image
 pixelssFromImage :: PNGImage -> IO [[Pixel]]
-pixelssFromImage image = mapM (pixelsFromRow width) rows where
+pixelssFromImage image = mapM (pixelsFromRow depth width) rows where
     width = widthImage image
     rows = rowsImage image
+    depth = depthImage image
 
 c_PNG_LIBPNG_VER_STRING :: CString
 c_PNG_LIBPNG_VER_STRING = unsafePerformIO $ newCString "1.6.16"
@@ -106,11 +118,26 @@ c_PNG_COMPRESSION_TYPE_BASE = 0
 c_PNG_FILTER_TYPE_BASE :: Int
 c_PNG_FILTER_TYPE_BASE = 0
 
+c_PNG_COLOR_TYPE_GRAY :: Word8
+c_PNG_COLOR_TYPE_GRAY = 0
+
 c_PNG_COLOR_TYPE_RGB :: Word8
 c_PNG_COLOR_TYPE_RGB = 2
 
+c_PNG_COLOR_TYPE_PALETTE :: Word8
+c_PNG_COLOR_TYPE_PALETTE = 3
+
+c_PNG_COLOR_TYPE_GRAY_ALPHA :: Word8
+c_PNG_COLOR_TYPE_GRAY_ALPHA = 4
+
+c_PNG_COLOR_TYPE_RGB_ALPHA :: Word8
+c_PNG_COLOR_TYPE_RGB_ALPHA = 6
+
 c_PNG_FILLER_AFTER :: Int
 c_PNG_FILLER_AFTER = 1
+
+c_PNG_INFO_tRNS :: Word
+c_PNG_INFO_tRNS = 0x0010
 
 foreign import ccall "png.h png_create_read_struct"
     c_png_create_read_struct :: CString -> Ptr () -> Ptr () -> Ptr ()
@@ -161,8 +188,26 @@ foreign import ccall "png.h png_get_image_width"
 foreign import ccall "png.h png_get_image_height"
     c_png_get_image_height :: PNG -> PNGInfo -> IO Word
 
+foreign import ccall "png.h png_get_valid"
+    c_png_get_valid :: PNG -> PNGInfo -> Word -> IO Word
+
 foreign import ccall "png.h png_get_color_type"
     c_png_get_color_type :: PNG -> PNGInfo -> IO Word8
+
+foreign import ccall "png.h png_get_bit_depth"
+    c_png_get_bit_depth :: PNG -> PNGInfo -> IO Word8
+
+foreign import ccall "png.h png_set_expand_gray_1_2_4_to_8"
+    c_png_set_expand_gray_1_2_4_to_8 :: PNG -> IO ()
+
+foreign import ccall "png.h png_set_palette_to_rgb"
+    c_png_set_palette_to_rgb :: PNG -> IO ()
+
+foreign import ccall "png.h png_set_strip_16"
+    c_png_set_strip_16 :: PNG -> IO ()
+
+foreign import ccall "png.h png_set_tRNS_to_alpha"
+    c_png_set_tRNS_to_alpha :: PNG -> IO ()
 
 foreign import ccall "png.h png_set_filler"
     c_png_set_filler :: PNG -> Word -> Int -> IO ()
@@ -226,10 +271,22 @@ readPNGImage pngFilename = withCString pngFilename $ \c_png_filename -> do
     width <- c_png_get_image_width png info
     height <- c_png_get_image_height png info
     color_type <- c_png_get_color_type png info
-    if color_type == c_PNG_COLOR_TYPE_RGB
-        then c_png_set_filler png 255 c_PNG_FILLER_AFTER
-        else return ()
-    rows <- replicateM (fromIntegral $ height) (rowEmpty width)
+    bit_depth <- c_png_get_bit_depth png info
+    tRNS <- c_png_get_valid png info c_PNG_INFO_tRNS
+    when (bit_depth == 16)$ c_png_set_strip_16 png
+    when (color_type == c_PNG_COLOR_TYPE_GRAY && bit_depth < 8)$ c_png_set_expand_gray_1_2_4_to_8 png
+    when (color_type == c_PNG_COLOR_TYPE_PALETTE)$ c_png_set_palette_to_rgb png
+    when (tRNS /= 0)$ c_png_set_tRNS_to_alpha png
+    let
+      depth
+        | color_type == c_PNG_COLOR_TYPE_GRAY = 1
+        | color_type == c_PNG_COLOR_TYPE_GRAY_ALPHA = 2
+        | color_type == c_PNG_COLOR_TYPE_RGB = 3
+        | otherwise = 4
+      alphaPos
+        | color_type == c_PNG_COLOR_TYPE_GRAY || color_type == c_PNG_COLOR_TYPE_RGB = depth
+        | otherwise = depth - 1
+    rows <- replicateM (fromIntegral $ height) (rowEmpty depth width)
     withForeignPtrs (map foreignPtrRow rows) $
         \rowps -> withArray rowps $
         \rowpp -> c_png_read_image png rowpp
@@ -238,6 +295,8 @@ readPNGImage pngFilename = withCString pngFilename $ \c_png_filename -> do
     return PNGImage
         { widthImage = width
         , heightImage = height
+        , depthImage = depth
+        , alphaPosImage = alphaPos
         , rowsImage = rows }
 
 --
